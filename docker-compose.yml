@@ -1,0 +1,62 @@
+# SONiC Telemetry Stack
+# 自动生成的配置，请勿手动修改targets部分
+# 使用 ./scripts/auto-refresh.sh 更新配置
+
+services:
+  gnmic:
+    image: ghcr.io/openconfig/gnmic:latest
+    container_name: gnmic
+    restart: unless-stopped
+    volumes:
+      - ./gnmic/gnmic.yaml:/app/gnmic.yaml:ro
+    command: subscribe --config /app/gnmic.yaml
+    ports:
+      - "9804:9804"
+    networks:
+      - sonic-telemetry
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    restart: unless-stopped
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - /data/sonic-telemetry/data/prometheus:/prometheus  # 绑定到/data
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--storage.tsdb.retention.size=50GB'
+      - '--web.enable-lifecycle'
+    ports:
+      - "9090:9090"
+    networks:
+      - sonic-telemetry
+    depends_on:
+      - gnmic
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: unless-stopped
+    volumes:
+      - /data/sonic-telemetry/data/grafana:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    ports:
+      - "3000:3000"
+    networks:
+      - sonic-telemetry
+    depends_on:
+      - prometheus
+
+networks:
+  sonic-telemetry:
+    driver: bridge
+
+    #volumes:
+    #prometheus_data:
+    #grafana_data:

@@ -1,0 +1,175 @@
+{
+  "editable": true,
+  "templating": {
+    "list": [
+      {
+        "name": "switch",
+        "label": "Switch",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+        "query": "label_values(sonic_port_SAI_PORT_STAT_IF_IN_OCTETS, source)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": {"selected": true, "text": "All", "value": "$__all"}
+      },
+      {
+        "name": "port",
+        "label": "Port",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+        "query": "label_values(sonic_port_SAI_PORT_STAT_IF_IN_OCTETS{source=~\"$switch\"}, port)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": {"selected": true, "text": "All", "value": "$__all"}
+      },
+      {
+        "name": "queue",
+        "label": "Queue",
+        "type": "custom",
+        "query": "0,1,2,3,4,5,6,7",
+        "includeAll": true,
+        "multi": true,
+        "current": {"selected": true, "text": "All", "value": "$__all"}
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Port Traffic - IN",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 0},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 10, "showPoints": "never"}
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "sortBy": "Max", "sortDesc": true, "calcs": ["min", "max", "lastNotNull"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [{"expr": "rate(sonic_port_SAI_PORT_STAT_IF_IN_OCTETS{source=~\"$switch\", port=~\"$port\"}[30s]) * 8", "legendFormat": "{{source}} - {{port}}"}],
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"}
+    },
+    {
+      "id": 2,
+      "title": "Port Traffic - OUT",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 10, "showPoints": "never"}
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "sortBy": "Max", "sortDesc": true, "calcs": ["min", "max", "lastNotNull"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [{"expr": "rate(sonic_port_SAI_PORT_STAT_IF_OUT_OCTETS{source=~\"$switch\", port=~\"$port\"}[30s]) * 8", "legendFormat": "{{source}} - {{port}}"}],
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"}
+    },
+    {
+      "id": 3,
+      "title": "PFC (pps)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 16},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps",
+          "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 10, "showPoints": "never"}
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "sortBy": "Max", "sortDesc": true, "calcs": ["min", "max", "lastNotNull"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {"expr": "increase(sonic_port_PFC_PKTS{source=~\"$switch\", port=~\"$port\", pfc_priority=~\"$queue\"}[1m]) / 60", "legendFormat": "{{source}} - {{port}} - {{pfc_direction}} - q{{pfc_priority}}"}
+      ],
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"}
+    },
+    {
+      "id": 4,
+      "title": "OQ Watermark (Egress Queue)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 24},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 10, "showPoints": "never"}
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "sortBy": "Max", "sortDesc": true, "calcs": ["min", "max", "lastNotNull"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [{"expr": "sonic_queue_SAI_QUEUE_STAT_WATERMARK_BYTES{source=~\"$switch\", queue_port=~\"$port\", queue_num=~\"$queue\"}", "legendFormat": "{{source}} - {{queue}}"}],
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"}
+    },
+    {
+      "id": 5,
+      "title": "SQ Watermark (Ingress PG)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 32},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 10, "showPoints": "never"}
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "sortBy": "Max", "sortDesc": true, "calcs": ["min", "max", "lastNotNull"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [{"expr": "sonic_pg_SAI_INGRESS_PRIORITY_GROUP_STAT_WATERMARK_BYTES{source=~\"$switch\", pg_port=~\"$port\", pg_num=~\"$queue\"}", "legendFormat": "{{source}} - {{pg}}"}],
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"}
+    },
+    {
+      "id": 6,
+      "title": "Queue Drop (pps)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 40},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps",
+          "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 10, "showPoints": "never"}
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "sortBy": "Max", "sortDesc": true, "calcs": ["min", "max", "lastNotNull"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [{"expr": "increase(sonic_queue_SAI_QUEUE_STAT_DROPPED_PACKETS{source=~\"$switch\", queue_port=~\"$port\", queue_num=~\"$queue\"}[1m]) / 60", "legendFormat": "{{source}} - {{queue}}"}],
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"}
+    },
+    {
+      "id": 7,
+      "title": "ACL Counter (pps)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 48},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps",
+          "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 10, "showPoints": "never"}
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "sortBy": "Max", "sortDesc": true, "calcs": ["min", "max", "lastNotNull"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [{"expr": "increase(sonic_acl_SAI_ACL_COUNTER_ATTR_PACKETS{source=~\"$switch\", acl_port=~\"$port\"}[1m]) / 60", "legendFormat": "{{source}} - {{acl_rule}}"}],
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"}
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 38,
+  "tags": ["sonic", "rdma", "pfc", "watermark", "acl"],
+  "time": {"from": "now-1h", "to": "now"},
+  "title": "SONiC RDMA Monitor",
+  "uid": "sonic-rdma-v3",
+  "version": 1
+}
