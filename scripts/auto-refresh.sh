@@ -1,10 +1,11 @@
 #!/bin/bash
 # ============================================================
-# SONiC Telemetry 自动配置刷新脚本 v3
+# SONiC Telemetry 自动配置刷新脚本 v4
 # 
 # 改进：
 # - v2: 每台交换机独立订阅，避免OID不存在导致订阅失败
 # - v3: 整合服务器 RDMA 监控支持
+# - v4: ACL 模块优化，从 CONFIG_DB 获取 stage 和 port
 # ============================================================
 
 set -e
@@ -204,28 +205,52 @@ load_module_config() {
     return 0
 }
 
-load_acl_rule_mapping() {
-    local config_file="$MODULES_DIR/acl.conf"
-    declare -gA ACL_RULE_MAPPING
+# ============================================================
+# v4 新增：ACL table 信息收集（从 CONFIG_DB）
+# ============================================================
+
+collect_acl_table_info() {
+    local switch_name=$1
+    local ip=${SWITCH_IPS[$switch_name]}
+    local user=${SWITCH_USERS[$switch_name]}
+    local pass=${SWITCH_PASSES[$switch_name]}
+    local cache_dir="$CACHE_DIR/$switch_name"
+    local output_file="$cache_dir/acl_table_info.json"
     
-    [[ ! -f "$config_file" ]] && return
+    log DEBUG "[$switch_name] 收集 ACL table 信息从 CONFIG_DB..."
     
-    local in_mapping=false
-    while IFS= read -r line; do
-        if [[ "$line" == "[rule_mapping]" ]]; then
-            in_mapping=true
-            continue
-        fi
-        if [[ "$line" =~ ^\[.*\]$ ]]; then
-            in_mapping=false
-            continue
-        fi
-        if $in_mapping && [[ "$line" =~ ^[A-Za-z_0-9]+=.+$ ]]; then
-            local rule_name=$(echo "$line" | cut -d'=' -f1)
-            local display_name=$(echo "$line" | cut -d'=' -f2)
-            ACL_RULE_MAPPING[$rule_name]=$display_name
-        fi
-    done < "$config_file"
+    # 使用 gnmic 从 CONFIG_DB 获取 ACL_TABLE 信息
+    local result
+    result=$(timeout $GNMI_TIMEOUT gnmic -a "${ip}:${GNMI_PORT}" \
+        --insecure \
+        -u "$user" \
+        -p "$pass" \
+        get --path "ACL_TABLE" \
+        --target CONFIG_DB 2>/dev/null || echo "")
+    
+    if [[ -z "$result" ]]; then
+        log DEBUG "[$switch_name] 无法从 CONFIG_DB 获取 ACL_TABLE 信息"
+        echo "{}" > "$output_file"
+        return 1
+    fi
+    
+    # 提取 ACL_TABLE 数据并保存
+    echo "$result" | jq -r '.[0].updates[0].values.ACL_TABLE // {}' > "$output_file"
+    
+    if [[ ! -s "$output_file" ]] || [[ "$(cat "$output_file")" == "{}" ]]; then
+        log DEBUG "[$switch_name] CONFIG_DB 中没有 ACL_TABLE 数据"
+        echo "{}" > "$output_file"
+        return 1
+    fi
+    
+    # 统计信息
+    local table_count=$(jq 'keys | length' "$output_file")
+    local ingress_count=$(jq '[.[] | select(.stage == "INGRESS")] | length' "$output_file")
+    local egress_count=$(jq '[.[] | select(.stage == "EGRESS")] | length' "$output_file")
+    
+    log INFO "  acl_table: $table_count 个 (ingress=$ingress_count, egress=$egress_count)"
+    
+    return 0
 }
 
 # ============================================================
@@ -379,6 +404,9 @@ collect_all_oids() {
                 log INFO "  $module: $count 个OID"
             fi
         done
+        
+        # v4 新增：收集 ACL table 信息
+        collect_acl_table_info "$switch_name" || true
     done
     
     # 合并所有交换机的映射（用于prometheus relabel）
@@ -432,6 +460,25 @@ compare_and_report() {
                 fi
             fi
         done
+        
+        # v4 新增：检查 ACL table 信息变更
+        local acl_info_new="$switch_cache_dir/acl_table_info.json"
+        local acl_info_old="$switch_cache_dir/acl_table_info_old.json"
+        if [[ -f "$acl_info_new" ]]; then
+            if [[ ! -f "$acl_info_old" ]]; then
+                local table_count=$(jq 'keys | length' "$acl_info_new" 2>/dev/null || echo 0)
+                [[ $table_count -gt 0 ]] && {
+                    log INFO "$switch_name/acl_table: 新增 $table_count 个 ACL table"
+                    has_changes=true
+                }
+            else
+                local diff_result=$(diff <(jq -S . "$acl_info_old") <(jq -S . "$acl_info_new") 2>/dev/null || echo "changed")
+                if [[ -n "$diff_result" ]]; then
+                    log INFO "$switch_name/acl_table: ACL table 配置已变更"
+                    has_changes=true
+                fi
+            fi
+        fi
     done
     
     # 检查服务器变更
@@ -472,7 +519,7 @@ generate_gnmic_config() {
     local output="$GNMIC_DIR/gnmic.yaml"
     
     cat > "$output" << EOF
-# SONiC Telemetry gNMIc配置 (v3)
+# SONiC Telemetry gNMIc配置 (v4)
 # 自动生成于: $(date '+%Y-%m-%d %H:%M:%S')
 # 模式: 每交换机独立订阅
 
@@ -506,6 +553,7 @@ EOF
 
     # 为每台交换机生成独立的订阅
     for switch_name in "${ONLINE_SWITCHES[@]}"; do
+        local ip=${SWITCH_IPS[$switch_name]}
         for conf in "$MODULES_DIR"/*.conf; do
             [[ ! -f "$conf" ]] && continue
             local module=$(basename "$conf" .conf)
@@ -516,7 +564,6 @@ EOF
             
             cat >> "$output" << EOF
   ${module}_counters_${switch_name}:
-    address: ${ip}:${GNMI_PORT}
     paths:
 EOF
             
@@ -547,13 +594,89 @@ EOF
     log INFO "gnmic配置已生成"
 }
 
+# v4 新增：生成 ACL relabel 规则
+generate_acl_relabel_rules() {
+    local output=$1
+    
+    # 收集所有交换机的 ACL table 信息
+    declare -A ALL_ACL_TABLE_STAGE
+    declare -A ALL_ACL_TABLE_PORT
+    
+    for switch_name in "${ONLINE_SWITCHES[@]}"; do
+        local info_file="$CACHE_DIR/$switch_name/acl_table_info.json"
+        [[ ! -f "$info_file" ]] && continue
+        
+        # 解析 JSON 并填充映射数组
+        while IFS='|' read -r table_name stage ports; do
+            [[ -z "$table_name" ]] && continue
+            ALL_ACL_TABLE_STAGE["$table_name"]="${stage,,}"  # 转小写
+            # ports@ 可能包含多个端口，取第一个
+            ALL_ACL_TABLE_PORT["$table_name"]="${ports%%,*}"
+        done < <(jq -r 'to_entries[] | "\(.key)|\(.value.stage // "INGRESS")|\(.value["ports@"] // "")"' "$info_file" 2>/dev/null)
+    done
+    
+    # 如果没有 ACL table 信息，跳过
+    [[ ${#ALL_ACL_TABLE_STAGE[@]} -eq 0 ]] && return
+    
+    cat >> "$output" << 'EOF'
+      # ────────────────────────────────────────────────────────
+      # ACL 标签提取 (v4: 从 CONFIG_DB 获取 stage 和 port)
+      # ────────────────────────────────────────────────────────
+      # 提取 acl_table (ACL 表名)
+      - source_labels: [acl_rule]
+        regex: '(.+):RULE_[0-9]+'
+        replacement: '${1}'
+        target_label: acl_table
+      # 提取 acl_seq (规则序号)
+      - source_labels: [acl_rule]
+        regex: '.+:RULE_([0-9]+)'
+        replacement: '${1}'
+        target_label: acl_seq
+EOF
+
+    # 生成 acl_table → acl_stage 映射
+    cat >> "$output" << 'EOF'
+      # ────────────────────────────────────────────────────────
+      # ACL table → stage 映射 (从 CONFIG_DB 获取)
+      # ────────────────────────────────────────────────────────
+EOF
+    for table_name in "${!ALL_ACL_TABLE_STAGE[@]}"; do
+        local stage=${ALL_ACL_TABLE_STAGE[$table_name]}
+        cat >> "$output" << EOF
+      - source_labels: [acl_table]
+        regex: '${table_name}'
+        replacement: '${stage}'
+        target_label: acl_stage
+EOF
+    done
+
+    # 生成 acl_table → acl_port 映射
+    cat >> "$output" << 'EOF'
+      # ────────────────────────────────────────────────────────
+      # ACL table → port 映射 (从 CONFIG_DB 获取)
+      # ────────────────────────────────────────────────────────
+EOF
+    for table_name in "${!ALL_ACL_TABLE_PORT[@]}"; do
+        local port=${ALL_ACL_TABLE_PORT[$table_name]}
+        [[ -z "$port" ]] && continue
+        cat >> "$output" << EOF
+      - source_labels: [acl_table]
+        regex: '${table_name}'
+        replacement: '${port}'
+        target_label: acl_port
+EOF
+    done
+
+    echo "" >> "$output"
+}
+
 generate_prometheus_config() {
     log DEBUG "生成prometheus配置..."
     
     local output="$PROMETHEUS_DIR/prometheus.yml"
     
     cat > "$output" << EOF
-# SONiC Telemetry + Server RDMA Prometheus配置 (v3)
+# SONiC Telemetry + Server RDMA Prometheus配置 (v4)
 # 自动生成于: $(date '+%Y-%m-%d %H:%M:%S')
 
 global:
@@ -613,8 +736,8 @@ EOF
                 echo "        target_label: $label_name" >> "$output"
             done < "$map_file"
 
-            # 提取子标签
-            if [[ -n "$extract_labels" ]]; then
+            # 提取子标签（非 ACL 模块）
+            if [[ "$module" != "acl" && -n "$extract_labels" ]]; then
                 IFS=';' read -ra LABEL_RULES <<< "$extract_labels"
                 for rule in "${LABEL_RULES[@]}"; do
                     local lbl_name=$(echo "$rule" | cut -d':' -f1)
@@ -651,23 +774,8 @@ EOF
 
 EOF
 
-        # ACL类型映射
-        load_acl_rule_mapping
-        if [[ ${#ACL_RULE_MAPPING[@]} -gt 0 ]]; then
-            cat >> "$output" << EOF
-      # ────────────────────────────────────────────────────────
-      # ACL 规则类型映射
-      # ────────────────────────────────────────────────────────
-EOF
-            for rule_name in "${!ACL_RULE_MAPPING[@]}"; do
-                local display_name=${ACL_RULE_MAPPING[$rule_name]}
-                echo "      - source_labels: [acl_rule]" >> "$output"
-                echo "        regex: '.+:${rule_name}'" >> "$output"
-                echo "        replacement: '${display_name}'" >> "$output"
-                echo "        target_label: acl_type" >> "$output"
-            done
-            echo "" >> "$output"
-        fi
+        # v4: ACL relabel 规则（从 CONFIG_DB 生成）
+        generate_acl_relabel_rules "$output"
     fi
 
     # ============================================================
@@ -739,6 +847,9 @@ update_cache() {
         for file in "$CACHE_DIR/$switch_name"/*_new.txt; do
             [[ -f "$file" ]] && mv "$file" "${file/_new.txt/_old.txt}"
         done
+        # v4 新增：更新 ACL table 信息缓存
+        local acl_info="$CACHE_DIR/$switch_name/acl_table_info.json"
+        [[ -f "$acl_info" ]] && cp "$acl_info" "${acl_info%.json}_old.json"
     done
     
     # 更新合并的映射缓存
@@ -761,7 +872,7 @@ update_cache() {
 
 show_help() {
     cat << EOF
-SONiC Telemetry + Server RDMA 自动配置刷新脚本 v3
+SONiC Telemetry + Server RDMA 自动配置刷新脚本 v4
 
 用法: $0 [选项]
 
@@ -774,11 +885,12 @@ SONiC Telemetry + Server RDMA 自动配置刷新脚本 v3
   - 每台交换机独立订阅，避免OID冲突
   - 自动检测OID前缀
   - 支持多种Counter模块
-  - 整合服务器 RDMA 监控 (v3 新增)
+  - 整合服务器 RDMA 监控 (v3)
+  - ACL 从 CONFIG_DB 获取 stage/port (v4)
 
 配置文件:
   config/switches.conf  - 交换机列表
-  config/servers.conf   - 服务器列表 (v3 新增)
+  config/servers.conf   - 服务器列表
   config/settings.conf  - 全局设置
   config/modules/*.conf - 模块配置
 
@@ -800,8 +912,8 @@ main() {
     
     echo ""
     echo -e "${BLUE}╔════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║      SONiC Telemetry + Server RDMA 配置刷新工具 v3         ║${NC}"
-    echo -e "${BLUE}║      (交换机独立订阅 + 服务器RDMA监控)                      ║${NC}"
+    echo -e "${BLUE}║      SONiC Telemetry + Server RDMA 配置刷新工具 v4         ║${NC}"
+    echo -e "${BLUE}║      (ACL 从 CONFIG_DB 获取 stage/port)                    ║${NC}"
     echo -e "${BLUE}╚════════════════════════════════════════════════════════════╝${NC}"
     echo ""
     echo "  时间: $(date '+%Y-%m-%d %H:%M:%S')"
