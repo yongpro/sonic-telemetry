@@ -1,11 +1,12 @@
 #!/bin/bash
 # ============================================================
-# SONiC Telemetry 自动配置刷新脚本 v4
+# SONiC Telemetry 自动配置刷新脚本 v5
 # 
 # 改进：
 # - v2: 每台交换机独立订阅，避免OID不存在导致订阅失败
 # - v3: 整合服务器 RDMA 监控支持
 # - v4: ACL 模块优化，从 CONFIG_DB 获取 stage 和 port
+# - v5: 通过prometheus过滤掉交叉污染的数据（比如source=dut1 但 subscription_name=port_counters_dut2）
 # ============================================================
 
 set -e
@@ -543,7 +544,17 @@ EOF
     address: ${ip}:${GNMI_PORT}
     username: $user
     password: $pass
+    subscriptions:
 EOF
+        # 只绑定该交换机自己的订阅
+        for conf in "$MODULES_DIR"/*.conf; do
+            [[ ! -f "$conf" ]] && continue
+            local module=$(basename "$conf" .conf)
+            load_module_config "$module" || continue
+            local oids_file="$CACHE_DIR/$switch_name/${module}_oids_new.txt"
+            [[ ! -s "$oids_file" ]] && continue
+            echo "      - ${module}_counters_${switch_name}" >> "$output"
+        done
     done
 
     cat >> "$output" << EOF
@@ -698,7 +709,26 @@ EOF
     static_configs:
       - targets: ['gnmic:$GNMIC_METRICS_PORT']
     metric_relabel_configs:
+      # ────────────────────────────────────────────────────────
+      # 丢弃 source 与 subscription 不匹配的交叉污染数据
+      # 例如: source=dut1 但 subscription_name=port_counters_dut2
+      # ────────────────────────────────────────────────────────
 EOF
+        # 为每对交换机生成 drop 规则
+        for src_switch in "${ONLINE_SWITCHES[@]}"; do
+            local src_lower=$(echo "$src_switch" | tr '[:upper:]' '[:lower:]')
+            # 生成"其他所有交换机名"的匹配模式
+            for other_switch in "${ONLINE_SWITCHES[@]}"; do
+                [[ "$other_switch" == "$src_switch" ]] && continue
+                local other_lower=$(echo "$other_switch" | tr '[:upper:]' '[:lower:]')
+                cat >> "$output" << EOF
+      - source_labels: [source, subscription_name]
+        regex: '${src_lower};.*_${other_lower}'
+        action: drop
+EOF
+            done
+        done
+        echo "" >> "$output"
 
         # 为每个模块生成relabel规则
         for conf in "$MODULES_DIR"/*.conf; do
